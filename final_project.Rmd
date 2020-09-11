@@ -1,0 +1,260 @@
+---
+title: "Final Project--Research Methods"
+author: "Abuzar Royesh"
+date: "3/6/2019"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+#Parameters
+library(tidyverse)
+library(sf)
+library(lfe)
+library(plm)
+# library(SDMTools)
+library(modelr)
+library(stringr)
+
+# data files ===================================================================
+imr_saod_file <- "imr_saod_data.rds"
+deaths_file <- "API_SP.DYN.CDRT.IN_DS2_en_excel_v2_10473944.xls"
+countries_file <- "ne_50m_admin_0_countries/ne_50m_admin_0_countries.shp"
+
+imr_saod <- read_rds(imr_saod_file)
+
+saod_values <- 
+  c(
+    max(imr_saod$saod), 
+    quantile(imr_saod$saod, probs = 0.9), 
+    median(imr_saod$saod), 
+    quantile(imr_saod$saod, probs = 0.1), 
+    min(imr_saod$saod)
+  )
+
+saod_colors <- c("#fde724", "#fde724", "#ffac00", "#ff2700", "#ff2700")
+```
+
+Here, I am looking at the impact of sulfate aerosol optical depth levels (SAOD) and infant mortality rate in select countries. Volcanic eruptions release these particles into the air, which reflect sunlight. In my dataset, I have 2.1 million observations for infant mortality for 100,000+ clusters for 1975 to 2012. I have paired them with SAOD levels for the same location and year. During this period there were two notable volcanic eruptions that greatly increased SAOD levels: El Chichón (Mexico) in 1982 and Mount Pinatubo (Philippines) in 1992. 
+
+This is what the data looks like. 
+
+```{r}
+imr_saod
+```
+
+#Initial plots 
+```{r}
+#Mean saod over the years
+imr_saod %>% 
+  group_by(child_birth_year) %>% 
+  summarize(saod = mean(saod, na.rm = TRUE)) %>% 
+  ggplot(aes(child_birth_year, saod)) + 
+  geom_vline(xintercept = c(1982, 1991), linetype = "dashed", color = "gray70") + 
+  geom_line(color = "#ff2700") + 
+  geom_point(color = "#ff2700", size = 1) +
+  scale_x_continuous(breaks = seq(1975, 2012, 5), minor_breaks = NULL) + 
+  theme_minimal() + 
+  theme(
+    panel.grid =  element_blank() 
+  ) + 
+  labs(
+    x = "Year", 
+    y = "Stratospheric Aersol Optical Depth (μ)"
+  )
+
+#Mean IMR over the years
+imr_saod %>% 
+  group_by(child_birth_year) %>% 
+  summarize(imr = mean(IMR, na.rm = TRUE)) %>% 
+  ggplot(aes(child_birth_year, imr)) + 
+  geom_vline(xintercept = c(1982, 1991), linetype = "dashed", color = "gray70") + 
+  geom_line(color = "#ff2700") + 
+  geom_point(color = "#ff2700", size = 1) +
+  scale_x_continuous(breaks = seq(1975, 2012, 5), minor_breaks = NULL) + 
+  theme_minimal() + 
+  theme(
+    panel.grid =  element_blank() 
+  ) + 
+  labs(
+    x = "Year", 
+    y = "Infant Mortality Rate (per 1000 births)"
+  )
+```
+
+###Plotting SAOD levels
+
+Here, I am plotting the SAOD levels before and after the volcanic eruption in Mount Pinatubo (1992). 
+
+```{r}
+saod_year <- function(year) {
+  imr_saod %>% 
+  # filter(child_birth_year >= 1990, child_birth_year <= 1992) %>% 
+  group_by(country, child_birth_year) %>% 
+  summarize(saod = mean(saod, na.rm = TRUE)) %>% 
+  filter(child_birth_year == year) 
+}
+
+world <- 
+  read_sf(countries_file) %>% 
+  select(SOVEREIGNT)
+
+world_plot <- function(year) {
+  world %>% 
+    left_join(saod_year(year), by = c("SOVEREIGNT" = "country")) %>% 
+    ggplot() + 
+    geom_sf(aes(fill = saod), color = "gray80", size = 0.2) + 
+    scale_fill_gradientn(
+      name = "SAOD",
+      colors = c("#fde724", "#fde724", "#ffac00", "#ff2700", "#ff2700"),
+      limits = c(0.0017, 0.178),
+      labels = scales::number_format(scale = , accuracy = 0.0001),
+      na.value = "gray96"
+    ) +
+    coord_sf(
+      ylim = c(-40, 50), 
+      xlim = c(-100, 140)
+    ) + 
+    theme_minimal() + 
+    labs(title = str_glue("Annual SAOD levels in {year}")) + 
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = rel(1)))
+}
+
+c(1990:1993) %>% #list the years for which I want maps 
+  map(world_plot)
+
+```
+
+```{r}
+cluster_locations <- 
+  imr_saod %>% 
+  distinct(country, cluster_lat, cluster_lon) %>% 
+  st_as_sf(coords = c("cluster_lon", "cluster_lat"), crs = 4326)
+
+cluster_locations %>% 
+  slice(1:3000) %>% #REMOVE THIS LINE FOR FULL ANALYSIS. Otherwise takes too long. 
+  ggplot() + 
+  geom_sf(data = world, color = "gray80", fill = "gray96", size = 0.2) + 
+  geom_sf(size = 1/3, color = "turquoise", shape = 21, alpha = 0.1) + 
+  coord_sf(
+    ylim = c(-40, 50), 
+    xlim = c(-100, 140)
+  ) + 
+  theme_minimal() + 
+  labs(
+    title = "Cluster Locations",
+    x = "Longtitude", 
+    y = "Latitude"
+  )
+```
+
+###No SAOD residuals
+
+Here I am plotting mean residuals from our a cluster and time fixed effects model when not accounting for SAOD. I am disaggregating my data by tropical and non-tropical. 
+```{r}
+no_saod_fit <- felm(IMR ~ 1 | child_birth_year + cluster_id, data = imr_saod)
+
+imr_saod$no_saod_resid <- summary(no_saod_fit)$residuals
+
+imr_saod %>% 
+  group_by(child_birth_year, tropical) %>% 
+  summarize(resid = mean(no_saod_resid, na.rm = TRUE)) %>% 
+  ggplot(aes(child_birth_year, resid, color = tropical)) + 
+  geom_vline(xintercept = c(1982, 1991), linetype = "dashed", color = "gray70") + 
+  geom_hline(yintercept = 0, color = "gray70") +
+  geom_line() + 
+  geom_point() + 
+  scale_x_continuous(breaks = seq(1975, 2012, 5)) + 
+  scale_color_viridis_d(breaks = NULL) +
+  theme_minimal() + 
+  theme_minimal() + 
+  theme(
+    panel.grid =  element_blank() 
+  ) + 
+  labs(
+    x = "Year", 
+    y = "Residuals"
+  ) + 
+  annotate(
+    geom = "text", 
+    x = 2011, 
+    y = c(-3, 5), 
+    label = c("Tropical", "Non-Tropical"), 
+    hjust = "right"
+  )
+```
+
+
+###cluster and time fixed effects for tropical and non-tropical regions
+```{r}
+fit_tropical <- 
+  felm(
+    IMR ~ saod | child_birth_year + cluster_id, 
+    data = imr_saod %>% filter(tropical == "Yes"), 
+    weights = imr_saod %>% filter(tropical == "Yes") %>% pull(n)
+  )
+
+fit_nontropical <- 
+  felm(
+    IMR ~ saod | child_birth_year + cluster_id, 
+    data = imr_saod %>% filter(tropical == "No"), 
+    weights = imr_saod %>% filter(tropical == "No") %>% pull(n)
+  )
+
+summary(fit_tropical, robust = TRUE)
+summary(fit_nontropical, robust = TRUE)
+```
+
+###Adding death rates to the models
+
+I am adding death rates to partially account for the impact of wars, famine, diseases, etc. 
+
+```{r}
+deaths <- 
+  readxl::read_excel(deaths_file, skip = 3) %>% 
+  select(-c(`Country Code`, `Indicator Name`, `Indicator Code`)) %>% 
+  gather(key = year, value = death_rate, -`Country Name`) %>% 
+  mutate(year = as.integer(year)) %>% 
+  arrange(`Country Name`, year) %>% 
+  mutate(
+    country = case_when(
+      `Country Name` == "Congo, Dem. Rep." ~ "Democratic Republic of the Congo", 
+      `Country Name` == "Egypt, Arab Rep." ~ "Egypt",
+      `Country Name` == "Eswatini" ~ "Swaziland",
+      `Country Name` == "Timor-Leste" ~ "Timor", 
+      TRUE ~ `Country Name`
+    )
+  ) %>% 
+  select(-`Country Name`)
+```
+
+Running the models here: 
+```{r}
+imr_saod_add <- 
+  imr_saod %>% 
+  left_join(deaths, by = c("country", "child_birth_year" = "year")) %>% 
+  arrange(cluster_id)
+
+fit2_tropical <- 
+  felm(
+    IMR ~ saod + death_rate | child_birth_year + cluster_id, 
+    data = imr_saod_add %>% filter(tropical == "Yes"), 
+    weights = imr_saod_add %>% filter(tropical == "Yes") %>% pull(n)
+  )
+
+fit2_nontropical <- 
+  felm(
+    IMR ~ saod + death_rate | child_birth_year + cluster_id, 
+    data = imr_saod_add %>% filter(tropical == "No"), 
+    weights = imr_saod_add %>% filter(tropical == "No") %>% pull(n)
+  )
+
+summary(fit2_tropical, robust = TRUE)
+summary(fit2_nontropical, robust = TRUE)
+```
+
+In non-tropical clusters, we find that SAOD levels were a significant predictor of infant mortality. 
+
